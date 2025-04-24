@@ -1,141 +1,208 @@
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+const jsonrpc = require('jsonrpc-lite');
+const fs = require('fs');
+const path = require('path');
 
-// Initialize Express app
-const app = express();
-const PORT = process.env.PORT || 3000;
+// Load .mcp.json config file if it exists
+let mcpConfig = { org_id: '', project_id: '' };
+const mcpConfigPath = path.join(process.cwd(), '.mcp.json');
 
-// Enhanced CORS configuration for NextJS client
-app.use(cors({
-  origin: '*', // In production, restrict this to your NextJS app's domain
-  methods: ['GET'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  maxAge: 86400 // 24 hours cache for preflight requests
-}));
-
-// Middleware
-app.use(express.json());
-
-// Basic request logging
-app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-  next();
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({
-    status: 'error',
-    message: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message
-  });
-});
-
-// Validate Supabase credentials
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-  console.error('Missing Supabase credentials. Please set SUPABASE_URL and SUPABASE_ANON_KEY environment variables.');
-  process.exit(1);
+if (fs.existsSync(mcpConfigPath)) {
+  try {
+    mcpConfig = JSON.parse(fs.readFileSync(mcpConfigPath, 'utf8'));
+  } catch (err) {
+    console.error('Error reading .mcp.json:', err.message);
+  }
 }
 
-// Initialize Supabase client
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Get Supabase credentials from environment variables or config
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_ACCESS_TOKEN = process.env.SUPABASE_ACCESS_TOKEN;
 
-// Consistent response formatter
-const formatResponse = (success, data = null, message = null, statusCode = 200) => {
-  return {
-    success, 
-    data,
-    message,
-    timestamp: new Date().toISOString()
-  };
-};
+// Initialize Supabase client if direct credentials are provided
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_ANON_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+}
 
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.json(formatResponse(true, null, 'Supabase Read-Only MCP Server'));
-});
-
-// List tables endpoint
-app.get('/api/tables/:projectId', async (req, res) => {
-  try {
-    // For a read-only server, we use the Supabase client directly
-    // This gets tables from the public schema by default
-    const { data, error } = await supabase
-      .from('information_schema.tables')
-      .select('table_schema, table_name')
-      .eq('table_schema', 'public')
-      .neq('table_name', 'pg_stat_statements')
-      .order('table_name');
-    
-    if (error) throw error;
-    
-    const tables = data.map(table => ({
-      schema: table.table_schema,
-      name: table.table_name
-    }));
-    
-    res.json(formatResponse(true, { tables }));
-  } catch (error) {
-    console.error('Error listing tables:', error);
-    res.status(500).json(formatResponse(false, null, error.message, 500));
+// Define MCP tools
+const tools = [
+  {
+    name: 'list_tables',
+    description: 'Lists all tables in the public schema',
+    parameters: {
+      properties: {
+        project_id: { type: 'string', description: 'Project ID' }
+      },
+      required: ['project_id'],
+      type: 'object'
+    }
+  },
+  {
+    name: 'get_table_data',
+    description: 'Fetches data from a specific table with pagination',
+    parameters: {
+      properties: {
+        project_id: { type: 'string', description: 'Project ID' },
+        table_name: { type: 'string', description: 'Name of the table to fetch data from' },
+        limit: { type: 'number', description: 'Number of rows to return (default: 10)' },
+        page: { type: 'number', description: 'Page number (default: 0)' }
+      },
+      required: ['project_id', 'table_name'],
+      type: 'object'
+    }
   }
-});
+];
 
-// Get table data endpoint
-app.get('/api/data/:projectId/:tableName', async (req, res) => {
-  try {
-    const { tableName } = req.params;
-    const limit = parseInt(req.query.limit) || 10;
-    const page = parseInt(req.query.page) || 0;
-    const offset = page * limit;
+// Method implementations
+const methods = {
+  listTools: async () => {
+    return {
+      tools
+    };
+  },
+  
+  list_tables: async (params) => {
+    const projectId = params.project_id || mcpConfig.project_id;
     
-    // Check if table exists before querying
-    const { data: tableCheck, error: tableError } = await supabase
-      .from('information_schema.tables')
-      .select('table_name')
-      .eq('table_schema', 'public')
-      .eq('table_name', tableName)
-      .single();
-      
-    if (tableError || !tableCheck) {
-      return res.status(404).json(formatResponse(false, null, `Table '${tableName}' not found`, 404));
+    if (!supabase) {
+      throw new Error('Supabase client not initialized. Please set SUPABASE_URL and SUPABASE_ANON_KEY environment variables.');
     }
     
-    // Simple read-only query to fetch table data with pagination
-    const { data, error, count } = await supabase
-      .from(tableName)
-      .select('*', { count: 'exact' })
-      .range(offset, offset + limit - 1);
+    try {
+      const { data, error } = await supabase
+        .from('information_schema.tables')
+        .select('table_schema, table_name')
+        .eq('table_schema', 'public')
+        .neq('table_name', 'pg_stat_statements')
+        .order('table_name');
+      
+      if (error) throw error;
+      
+      return {
+        tables: data.map(table => ({
+          schema: table.table_schema,
+          name: table.table_name
+        }))
+      };
+    } catch (error) {
+      throw new Error(`Error listing tables: ${error.message}`);
+    }
+  },
+  
+  get_table_data: async (params) => {
+    const { table_name } = params;
+    const projectId = params.project_id || mcpConfig.project_id;
+    const limit = parseInt(params.limit) || 10;
+    const page = parseInt(params.page) || 0;
+    const offset = page * limit;
     
-    if (error) throw error;
+    if (!supabase) {
+      throw new Error('Supabase client not initialized. Please set SUPABASE_URL and SUPABASE_ANON_KEY environment variables.');
+    }
     
-    res.json(formatResponse(true, { 
-      rows: data,
-      pagination: {
-        total: count,
-        page,
-        limit,
-        pages: Math.ceil(count / limit)
+    try {
+      // Check if table exists before querying
+      const { data: tableCheck, error: tableError } = await supabase
+        .from('information_schema.tables')
+        .select('table_name')
+        .eq('table_schema', 'public')
+        .eq('table_name', table_name)
+        .single();
+        
+      if (tableError || !tableCheck) {
+        throw new Error(`Table '${table_name}' not found`);
       }
-    }));
+      
+      // Fetch table data with pagination
+      const { data, error, count } = await supabase
+        .from(table_name)
+        .select('*', { count: 'exact' })
+        .range(offset, offset + limit - 1);
+      
+      if (error) throw error;
+      
+      return {
+        rows: data,
+        pagination: {
+          total: count,
+          page,
+          limit,
+          pages: Math.ceil(count / limit)
+        }
+      };
+    } catch (error) {
+      throw new Error(`Error fetching data from table ${table_name}: ${error.message}`);
+    }
+  }
+};
+
+// Main JSON-RPC handler
+async function handleJsonRpc(message) {
+  try {
+    const parsed = jsonrpc.parse(message);
+    
+    if (parsed.type === 'invalid') {
+      return jsonrpc.error(null, jsonrpc.JsonRpcError.invalidRequest(parsed.payload.message));
+    }
+    
+    if (parsed.type !== 'request') {
+      return jsonrpc.error(null, jsonrpc.JsonRpcError.invalidRequest('Expected a JSON-RPC request'));
+    }
+    
+    const { payload } = parsed;
+    const { method, params, id } = payload;
+    
+    if (!methods[method]) {
+      return jsonrpc.error(id, jsonrpc.JsonRpcError.methodNotFound(`Method '${method}' not found`));
+    }
+    
+    try {
+      const result = await methods[method](params || {});
+      return jsonrpc.success(id, result);
+    } catch (error) {
+      return jsonrpc.error(id, jsonrpc.JsonRpcError.internalError(error.message));
+    }
   } catch (error) {
-    console.error(`Error fetching data from table ${req.params.tableName}:`, error);
-    res.status(500).json(formatResponse(false, null, error.message, 500));
+    return jsonrpc.error(null, jsonrpc.JsonRpcError.parseError(error.message));
+  }
+}
+
+// Set up STDIO handling
+process.stdin.setEncoding('utf8');
+
+let inputBuffer = '';
+process.stdin.on('data', async (chunk) => {
+  inputBuffer += chunk;
+  try {
+    // Basic line-by-line processing of JSON-RPC requests
+    const lines = inputBuffer.split('\n');
+    for (let i = 0; i < lines.length - 1; i++) {
+      const line = lines[i].trim();
+      if (line) {
+        const response = await handleJsonRpc(line);
+        process.stdout.write(JSON.stringify(response) + '\n');
+      }
+    }
+    inputBuffer = lines[lines.length - 1];
+  } catch (error) {
+    const errorResponse = jsonrpc.error(null, jsonrpc.JsonRpcError.internalError(error.message));
+    process.stdout.write(JSON.stringify(errorResponse) + '\n');
   }
 });
 
-// Handle 404 routes
-app.use((req, res) => {
-  res.status(404).json(formatResponse(false, null, 'Endpoint not found', 404));
+process.stdin.on('end', () => {
+  process.exit(0);
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Supabase URL: ${SUPABASE_URL}`);
-});
+// Log initialization but don't write to stdout (would break JSON-RPC protocol)
+process.stderr.write('Supabase MCP STDIO daemon initialized\n');
+if (supabase) {
+  process.stderr.write(`Connected to Supabase URL: ${SUPABASE_URL}\n`);
+} else if (SUPABASE_ACCESS_TOKEN) {
+  process.stderr.write('Using SUPABASE_ACCESS_TOKEN for authentication\n');
+} else {
+  process.stderr.write('WARNING: No Supabase credentials provided\n');
+}
